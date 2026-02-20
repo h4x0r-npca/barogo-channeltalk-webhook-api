@@ -16,22 +16,18 @@ app = FastAPI()
 
 CHANNELETALK_WEBHOOK_TOKEN = os.getenv("CHANNELETALK_WEBHOOK_TOKEN", "").strip()
 
-TEAM_ID_TECH = os.getenv("TEAM_ID_TECH", "13366").strip()  # 바다코리아기술지원
-TEAM_ID_CX = os.getenv("TEAM_ID_CX", "2704").strip()      # CX모아라인
+TEAM_ID_TECH = os.getenv("TEAM_ID_TECH", "13366").strip()
+TEAM_ID_CX = os.getenv("TEAM_ID_CX", "2704").strip()
 
 SLACK_WEBHOOK_URL_TECH = os.getenv("SLACK_WEBHOOK_URL_TECH", "").strip()
 SLACK_WEBHOOK_URL_CX = os.getenv("SLACK_WEBHOOK_URL_CX", "").strip()
 SLACK_WEBHOOK_URL_DEFAULT = os.getenv("SLACK_WEBHOOK_URL", "").strip()
 
-# ✅ 진짜 멘션: <@Uxxxx> 형태
-# (환경변수에 이미 <@U01...> 형태로 넣어두면 Slack에서 실제 태그됨)
-SLACK_MENTION_TECH = os.getenv("SLACK_MENTION_TECH", "@구교선").strip()
-SLACK_MENTION_CX = os.getenv("SLACK_MENTION_CX", "@박서현").strip()
+SLACK_MENTION_TECH = os.getenv("SLACK_MENTION_TECH", "").strip()
+SLACK_MENTION_CX = os.getenv("SLACK_MENTION_CX", "").strip()
 
-# ✅ Channel Desk 워크스페이스 (예: moaline)
 DESK_WORKSPACE = os.getenv("DESK_WORKSPACE", "moaline").strip()
 
-# 중복 방지 (같은 문의가 여러번 push 와도 1회만)
 DEDUP_TTL_SECONDS = int(os.getenv("DEDUP_TTL_SECONDS", "3600").strip() or "3600")
 _SENT_CACHE: Dict[str, float] = {}
 
@@ -57,7 +53,7 @@ def pick_slack_target(team_id: str) -> Tuple[str, str, str]:
         url = SLACK_WEBHOOK_URL_CX or SLACK_WEBHOOK_URL_DEFAULT
         return url, SLACK_MENTION_CX, "CX모아라인"
     url = SLACK_WEBHOOK_URL_DEFAULT or SLACK_WEBHOOK_URL_TECH or SLACK_WEBHOOK_URL_CX
-    return url, "", f"Unknown(teamId={team_id})"
+    return url, "", "문의"
 
 
 def dedup_should_send(key: str) -> bool:
@@ -67,7 +63,7 @@ def dedup_should_send(key: str) -> bool:
         _SENT_CACHE.pop(k, None)
 
     last = _SENT_CACHE.get(key)
-    if last is not None and (now - last) <= DEDUP_TTL_SECONDS:
+    if last and (now - last) <= DEDUP_TTL_SECONDS:
         return False
 
     _SENT_CACHE[key] = now
@@ -75,49 +71,27 @@ def dedup_should_send(key: str) -> bool:
 
 
 def post_to_slack(webhook_url: str, text: str) -> None:
-    print(f"SLACK: target_url_set={bool(webhook_url)} text_len={len(text)}")
-
     if not webhook_url:
-        print("SLACK: webhook url is empty. skip sending.")
+        print("SLACK: webhook url empty")
         return
 
     try:
         r = requests.post(webhook_url, json={"text": text}, timeout=8)
-        print(f"SLACK: status={r.status_code} resp={r.text[:300]}")
-        if r.status_code >= 300:
-            print(f"SLACK: failed body={r.text[:1000]}")
+        print(f"SLACK: status={r.status_code}")
     except Exception as e:
-        print(f"SLACK: exception {e}")
+        print(f"SLACK error: {e}")
 
 
-def is_new_inquiry_userchat_opened(payload: Dict[str, Any]) -> bool:
-    """
-    entity가 userChat 형태로 오는 케이스에서,
-    '신규 문의'를 userChat이 최초 opened 되는 순간으로 판정.
-    """
-    entity = _get(payload, "entity", {})
-    if not isinstance(entity, dict):
-        return False
-
-    state = entity.get("state")
-    managed = entity.get("managed")
-    opened_at = entity.get("openedAt")
-    first_opened_at = entity.get("firstOpenedAt")
-
+def is_new_inquiry(payload: Dict[str, Any]) -> bool:
+    entity = payload.get("entity", {})
     return (
-        state == "opened"
-        and managed is True
-        and opened_at is not None
-        and first_opened_at is not None
-        and opened_at == first_opened_at
+        entity.get("state") == "opened"
+        and entity.get("managed") is True
+        and entity.get("openedAt") == entity.get("firstOpenedAt")
     )
 
 
 def build_desk_url(workspace: str, user_name: str, chat_id: str) -> str:
-    """
-    예시:
-    https://desk.channel.io/moaline/user-chats/%EC%A0%95%ED%95%B4%EC%B9%A0-6997b426...
-    """
     safe_name = quote(user_name or "", safe="")
     return f"https://desk.channel.io/{workspace}/user-chats/{safe_name}-{chat_id}"
 
@@ -126,64 +100,50 @@ def build_desk_url(workspace: str, user_name: str, chat_id: str) -> str:
 # Routes
 # =========================
 
-@app.get("/")
-def root():
-    return {"ok": True, "message": "barogo channeltalk webhook api"}
-
-
-@app.get("/healthz")
-def healthz():
-    return {"status": "ok"}
-
-
 @app.post("/webhook")
 async def channeltalk_webhook(request: Request):
     token = request.query_params.get("token", "")
     if CHANNELETALK_WEBHOOK_TOKEN and token != CHANNELETALK_WEBHOOK_TOKEN:
         raise HTTPException(status_code=401, detail="Invalid token")
 
-    try:
-        payload = await request.json()
-    except Exception:
-        payload = {"_raw": (await request.body()).decode("utf-8", errors="ignore")}
+    payload = await request.json()
+    print("CHANNELETALK_WEBHOOK:", json.dumps(payload, ensure_ascii=False)[:2000])
 
-    print("CHANNELETALK_WEBHOOK:", json.dumps(payload, ensure_ascii=False)[:8000])
-
-    if not isinstance(payload, dict):
+    if not is_new_inquiry(payload):
         return JSONResponse({"received": True})
 
-    # ✅ 신규 문의 트리거: userChat 최초 opened
-    if is_new_inquiry_userchat_opened(payload):
-        entity = payload.get("entity", {}) or {}
-        msg = _get(payload, "refers.message", {}) or {}
+    entity = payload.get("entity", {}) or {}
+    msg = _get(payload, "refers.message", {}) or {}
+    user = _get(payload, "refers.user", {}) or {}
 
-        team_id = str(entity.get("teamId", "") or "")
-        chat_id = str(entity.get("id", "") or msg.get("chatId", "") or "")
-        channel_id = str(entity.get("channelId", "") or "")
-        user_name = str(entity.get("name", "") or _get(payload, "refers.user.name", "") or "")
-        text = str(msg.get("plainText", "") or "")
+    team_id = str(entity.get("teamId", "") or "")
+    chat_id = str(entity.get("id", "") or "")
+    user_name = str(entity.get("name", "") or user.get("name", "") or "고객")
+    phone = (
+        user.get("mobileNumber")
+        or _get(payload, "refers.user.profile.mobileNumber")
+        or "-"
+    )
+    text = str(msg.get("plainText", "") or "")
 
-        dedup_key = f"{team_id}:{chat_id}:new_inquiry_opened"
-        if dedup_should_send(dedup_key):
-            webhook_url, mention, team_name = pick_slack_target(team_id)
+    dedup_key = f"{team_id}:{chat_id}"
+    if not dedup_should_send(dedup_key):
+        return JSONResponse({"received": True})
 
-            # ✅ 채널톡 데스크 링크 생성
-            desk_url = build_desk_url(DESK_WORKSPACE, user_name, chat_id)
-            desk_link = f"<{desk_url}|채널톡에서 바로 열기>"
+    webhook_url, mention, team_name = pick_slack_target(team_id)
 
-            slack_text = (
-                f"📩 채널톡 신규 문의 ({team_name})\n"
-                f"{mention}\n"
-                f"- channelId: {channel_id}\n"
-                f"- teamId: {team_id}\n"
-                f"- chatId: {chat_id}\n"
-                f"- 고객: {user_name}\n"
-                f"- 내용:\n{text}\n\n"
-                f"👉 {desk_link}"
-            ).strip()
+    desk_url = build_desk_url(DESK_WORKSPACE, user_name, chat_id)
+    desk_link = f"<{desk_url}|👉 채널톡에서 바로 열기>"
 
-            post_to_slack(webhook_url, slack_text)
-        else:
-            print(f"SLACK: dedup hit. skip sending. key={dedup_key}")
+    slack_text = (
+        f"📩 신규 문의 ({team_name})\n"
+        f"{mention}\n\n"
+        f"👤 고객: {user_name}\n"
+        f"📞 휴대폰: {phone}\n\n"
+        f"📝 문의내용:\n{text}\n\n"
+        f"{desk_link}"
+    ).strip()
+
+    post_to_slack(webhook_url, slack_text)
 
     return JSONResponse({"received": True})
