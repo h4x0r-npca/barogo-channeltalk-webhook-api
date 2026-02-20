@@ -1,7 +1,8 @@
 import json
 import os
 import time
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Tuple
+from urllib.parse import quote
 
 import requests
 from fastapi import FastAPI, HTTPException, Request
@@ -22,9 +23,13 @@ SLACK_WEBHOOK_URL_TECH = os.getenv("SLACK_WEBHOOK_URL_TECH", "").strip()
 SLACK_WEBHOOK_URL_CX = os.getenv("SLACK_WEBHOOK_URL_CX", "").strip()
 SLACK_WEBHOOK_URL_DEFAULT = os.getenv("SLACK_WEBHOOK_URL", "").strip()
 
-# 진짜 멘션하려면 <@Uxxxx> 형태 권장
+# ✅ 진짜 멘션: <@Uxxxx> 형태
+# (환경변수에 이미 <@U01...> 형태로 넣어두면 Slack에서 실제 태그됨)
 SLACK_MENTION_TECH = os.getenv("SLACK_MENTION_TECH", "@구교선").strip()
 SLACK_MENTION_CX = os.getenv("SLACK_MENTION_CX", "@박서현").strip()
+
+# ✅ Channel Desk 워크스페이스 (예: moaline)
+DESK_WORKSPACE = os.getenv("DESK_WORKSPACE", "moaline").strip()
 
 # 중복 방지 (같은 문의가 여러번 push 와도 1회만)
 DEDUP_TTL_SECONDS = int(os.getenv("DEDUP_TTL_SECONDS", "3600").strip() or "3600")
@@ -57,7 +62,6 @@ def pick_slack_target(team_id: str) -> Tuple[str, str, str]:
 
 def dedup_should_send(key: str) -> bool:
     now = time.time()
-    # cleanup
     expired = [k for k, t in _SENT_CACHE.items() if now - t > DEDUP_TTL_SECONDS]
     for k in expired:
         _SENT_CACHE.pop(k, None)
@@ -88,20 +92,18 @@ def post_to_slack(webhook_url: str, text: str) -> None:
 
 def is_new_inquiry_userchat_opened(payload: Dict[str, Any]) -> bool:
     """
-    지금 네 로그처럼 entity가 userChat으로 오는 케이스에서,
+    entity가 userChat 형태로 오는 케이스에서,
     '신규 문의'를 userChat이 최초 opened 되는 순간으로 판정.
     """
     entity = _get(payload, "entity", {})
     if not isinstance(entity, dict):
         return False
 
-    # userChat 객체는 chatType이 없을 수도 있어서 state로 판단
     state = entity.get("state")
     managed = entity.get("managed")
     opened_at = entity.get("openedAt")
     first_opened_at = entity.get("firstOpenedAt")
 
-    # 최초 오픈 순간만 True
     return (
         state == "opened"
         and managed is True
@@ -109,6 +111,15 @@ def is_new_inquiry_userchat_opened(payload: Dict[str, Any]) -> bool:
         and first_opened_at is not None
         and opened_at == first_opened_at
     )
+
+
+def build_desk_url(workspace: str, user_name: str, chat_id: str) -> str:
+    """
+    예시:
+    https://desk.channel.io/moaline/user-chats/%EC%A0%95%ED%95%B4%EC%B9%A0-6997b426...
+    """
+    safe_name = quote(user_name or "", safe="")
+    return f"https://desk.channel.io/{workspace}/user-chats/{safe_name}-{chat_id}"
 
 
 # =========================
@@ -152,10 +163,13 @@ async def channeltalk_webhook(request: Request):
         user_name = str(entity.get("name", "") or _get(payload, "refers.user.name", "") or "")
         text = str(msg.get("plainText", "") or "")
 
-        # dedup key: teamId + chatId
         dedup_key = f"{team_id}:{chat_id}:new_inquiry_opened"
         if dedup_should_send(dedup_key):
             webhook_url, mention, team_name = pick_slack_target(team_id)
+
+            # ✅ 채널톡 데스크 링크 생성
+            desk_url = build_desk_url(DESK_WORKSPACE, user_name, chat_id)
+            desk_link = f"<{desk_url}|채널톡에서 바로 열기>"
 
             slack_text = (
                 f"📩 채널톡 신규 문의 ({team_name})\n"
@@ -164,7 +178,8 @@ async def channeltalk_webhook(request: Request):
                 f"- teamId: {team_id}\n"
                 f"- chatId: {chat_id}\n"
                 f"- 고객: {user_name}\n"
-                f"- 내용:\n{text}"
+                f"- 내용:\n{text}\n\n"
+                f"👉 {desk_link}"
             ).strip()
 
             post_to_slack(webhook_url, slack_text)
